@@ -24,7 +24,10 @@ interface WsIncomingMessage {
 interface SlotAssignedMessage {
   event_type: 'slot_assigned';
   slot_id: number;
+  /** 当前池内序号（1-based），断线重连不会一直涨 */
+  pool_index?: number;
   total_slots: number;
+  account_label?: string;
 }
 
 /** 后端下发的代理请求（必有 request_id/path/method 等） */
@@ -64,6 +67,7 @@ const DEFAULT_WS_URL = 'ws://127.0.0.1:9111';
 const STORAGE_KEYS = {
   WS_URL: 'candybox_ws_url',
   KEEP_ALIVE: 'candybox_keep_alive',
+  ACCOUNT_LABEL: 'candybox_account_label',
   STATS: 'candybox_stats',
   THEME: 'candybox_theme',
 };
@@ -177,7 +181,7 @@ class ConnectionManager {
   onStatusChange: ((connected: boolean) => void) | null = null;
   onLog: ((message: string, type: string) => void) | null = null;
   onMessage: ((msg: WsIncomingMessage) => void) | null = null;
-  onSlotAssigned: ((info: { slot_id: number; total_slots: number }) => void) | null = null;
+  onSlotAssigned: ((info: { slot_id: number; pool_index?: number; total_slots: number; account_label?: string }) => void) | null = null;
 
   // WebSocket 关闭码解决方案
   WS_CLOSE_SOLUTIONS: Record<number, string> = {
@@ -229,9 +233,12 @@ class ConnectionManager {
         try {
           const msg = JSON.parse(event.data);
           if ((msg as SlotAssignedMessage).event_type === 'slot_assigned' && this.onSlotAssigned) {
+            const m = msg as SlotAssignedMessage;
             this.onSlotAssigned({
-              slot_id: (msg as SlotAssignedMessage).slot_id,
-              total_slots: (msg as SlotAssignedMessage).total_slots,
+              slot_id: m.slot_id,
+              pool_index: m.pool_index,
+              total_slots: m.total_slots,
+              account_label: m.account_label,
             });
             return;
           }
@@ -261,6 +268,12 @@ class ConnectionManager {
     if (this.socket && this.isConnected) {
       this.socket.send(JSON.stringify(data));
     }
+  }
+
+  /** 上报账号标识（邮箱/昵称），后端按标识去重，同标识只保留最新连接 */
+  sendClientIdentify(accountLabel: string) {
+    if (!accountLabel?.trim() || !this.socket || !this.isConnected) return;
+    this.socket.send(JSON.stringify({ event_type: 'client_identify', account_label: accountLabel.trim() }));
   }
 
   private updateStatus(connected: boolean) {
@@ -589,8 +602,11 @@ const createProxySystem = () => {
     setStatusCallback(cb: (connected: boolean) => void) {
       conn.onStatusChange = cb;
     },
-    setSlotCallback(cb: (info: { slot_id: number; total_slots: number }) => void) {
+    setSlotCallback(cb: (info: { slot_id: number; pool_index?: number; total_slots: number; account_label?: string }) => void) {
       conn.onSlotAssigned = cb;
+    },
+    sendClientIdentify(accountLabel: string) {
+      conn.sendClientIdentify(accountLabel);
     },
     start(url: string, keepAliveMode: string) {
       conn.connect(url);
@@ -660,12 +676,13 @@ export default function App() {
   const [isDark, setIsDark] = useState(() => localStorage.getItem(STORAGE_KEYS.THEME) === 'dark');
   const [sessionInfo, setSessionInfo] = useState<SessionFingerprint | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
-  const [slotInfo, setSlotInfo] = useState<{ slot_id: number; total_slots: number } | null>(null);
+  const [slotInfo, setSlotInfo] = useState<{ slot_id: number; pool_index?: number; total_slots: number; account_label?: string } | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   
   // 配置
   const [wsUrl, setWsUrl] = useState(() => localStorage.getItem(STORAGE_KEYS.WS_URL) || DEFAULT_WS_URL);
   const [keepAliveMode, setKeepAliveMode] = useState(() => localStorage.getItem(STORAGE_KEYS.KEEP_ALIVE) || 'none');
+  const [accountLabel, setAccountLabel] = useState(() => localStorage.getItem(STORAGE_KEYS.ACCOUNT_LABEL) || '');
   
   // 统计
   const [stats, setStats] = useState<Stats>(() => {
@@ -714,6 +731,13 @@ export default function App() {
     ProxySystem.setStatsCallback(recordStats);
     ProxySystem.setSlotCallback(setSlotInfo);
   }, [addLog, recordStats]);
+
+  // 连接成功后上报账号标识，便于后端按邮箱/昵称去重
+  useEffect(() => {
+    if (wsConnected && accountLabel.trim()) {
+      ProxySystem.sendClientIdentify(accountLabel.trim());
+    }
+  }, [wsConnected, accountLabel]);
 
   // 主题切换
   useEffect(() => {
@@ -772,6 +796,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.KEEP_ALIVE, keepAliveMode);
   }, [keepAliveMode]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.ACCOUNT_LABEL, accountLabel);
+  }, [accountLabel]);
 
   // 连接切换
   const handleToggleConnection = useCallback(() => {
@@ -909,6 +937,19 @@ export default function App() {
                   <option value="pip">画中画视频</option>
                 </select>
               </div>
+
+              {/* 账号标识：用于多账号去重，同标识只保留最新连接 */}
+              <div>
+                <label className="text-xs text-slate-500 dark:text-purple-300/70 block mb-1">账号标识（选填，用于去重）</label>
+                <input
+                  type="text"
+                  value={accountLabel}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setAccountLabel(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-purple-500/30 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400 dark:text-purple-100"
+                  placeholder="如：主号邮箱或昵称"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">同一标识重复连接时，后端会踢掉旧连接，避免重复占用号位</p>
+              </div>
             </div>
           </details>
 
@@ -962,10 +1003,10 @@ export default function App() {
               }`}>
                 {isLoggedIn ? '✓ 已登录' : '✗ 未登录'}
               </span>
-              {/* 多号轮询：当前窗口号位 */}
+              {/* 多号轮询：当前窗口号位（含账号标识时显示） */}
               {slotInfo && (
                 <span className="text-xs font-medium text-violet-600 dark:text-violet-400" title="多窗口时后端将轮询使用各账号，避免单号超限">
-                  [{slotInfo.slot_id}/{slotInfo.total_slots} 号位]
+                  {slotInfo.account_label ? `[${slotInfo.account_label}] ` : ''}[{slotInfo.total_slots === 1 ? 1 : (slotInfo.pool_index ?? slotInfo.slot_id)}/{slotInfo.total_slots} 号位]
                 </span>
               )}
             </div>

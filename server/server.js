@@ -93,7 +93,7 @@ class MessageQueue {
 class ConnectionManager extends EventEmitter {
   constructor() {
     super();
-    /** @type {{ ws: WebSocket, slotId: number }[]} 多窗口连接池 */
+    /** @type {{ ws: WebSocket, slotId: number, accountLabel?: string }[]} 多窗口连接池 */
     this.connections = [];
     this._nextSlotId = 0;
     this._roundRobinIndex = 0;
@@ -104,31 +104,49 @@ class ConnectionManager extends EventEmitter {
 
   add(ws, info) {
     const slotId = ++this._nextSlotId;
-    const entry = { ws, slotId };
+    const entry = { ws, slotId, accountLabel: undefined };
     this.connections.push(entry);
     ws.slotId = slotId;
 
-    log.info(`🍬 浏览器已连接 [${slotId} 号位] 当前共 ${this.connections.length} 个窗口: ${info.address}`);
+    const poolIndex = this.connections.length;
+    log.info(`🍬 浏览器已连接 [${poolIndex} 号位] 当前共 ${this.connections.length} 个窗口: ${info.address}`);
 
-    ws.on('message', (data) => this.handleMessage(data.toString()));
+    ws.on('message', (data) => this.handleMessage(data.toString(), ws));
     ws.on('close', () => this.remove(ws));
     ws.on('error', (err) => log.error(`WebSocket错误 [${slotId}]: ${err.message}`));
 
     // 通知该窗口其号位与总数（多号轮询用）
-    this.sendTo(ws, {
-      event_type: 'slot_assigned',
-      slot_id: slotId,
-      total_slots: this.connections.length,
-    });
+    this.sendSlotAssigned(ws, entry);
 
     this.emit('connected', ws);
+  }
+
+  /** 向单个连接发送 slot_assigned（池内序号 + 总数，避免断线重连后号位一直涨） */
+  sendSlotAssigned(ws, entry) {
+    const poolIndex = this.connections.findIndex((e) => e.ws === entry.ws) + 1;
+    const payload = {
+      event_type: 'slot_assigned',
+      slot_id: entry.slotId,
+      pool_index: poolIndex,
+      total_slots: this.connections.length,
+    };
+    if (entry.accountLabel) payload.account_label = entry.accountLabel;
+    this.sendTo(ws, payload);
+  }
+
+  /** 向所有连接广播当前 slot 信息 */
+  broadcastSlotAssigned() {
+    this.connections.forEach((entry) => {
+      this.sendSlotAssigned(entry.ws, entry);
+    });
   }
 
   remove(ws) {
     const slotId = ws.slotId;
     const idx = this.connections.findIndex((e) => e.ws === ws);
+    const poolIndex = idx === -1 ? -1 : idx + 1;
     if (idx !== -1) this.connections.splice(idx, 1);
-    log.info(`🍬 浏览器已断开 [${slotId} 号位] 剩余 ${this.connections.length} 个窗口`);
+    log.info(`🍬 浏览器已断开 [${poolIndex} 号位] 剩余 ${this.connections.length} 个窗口`);
 
     for (const [rid, w] of this.requestTargets) {
       if (w === ws) this.requestTargets.delete(rid);
@@ -136,22 +154,32 @@ class ConnectionManager extends EventEmitter {
     this.queues.forEach((q) => q.close());
     this.queues.clear();
 
-    // 通知其余窗口总数变化
-    this.connections.forEach(({ ws: w }) => {
-      this.sendTo(w, {
-        event_type: 'slot_assigned',
-        slot_id: w.slotId,
-        total_slots: this.connections.length,
-      });
-    });
-
+    this.broadcastSlotAssigned();
     this.emit('disconnected', ws);
   }
 
-  handleMessage(data) {
+  handleMessage(data, ws) {
     try {
       const msg = JSON.parse(data);
       const { request_id, event_type } = msg;
+
+      // 客户端上报账号标识（邮箱/昵称），用于去重：同标识只保留最新连接
+      if (event_type === 'client_identify' && typeof msg.account_label === 'string' && msg.account_label.trim()) {
+        const label = msg.account_label.trim();
+        const currentEntry = this.connections.find((e) => e.ws === ws);
+        if (!currentEntry) return;
+
+        const sameLabel = this.connections.find((e) => e.ws !== ws && e.accountLabel === label);
+        if (sameLabel) {
+          log.info(`🍬 同账号标识 [${label}] 已有连接，关闭旧连接`);
+          sameLabel.ws.close();
+        }
+        currentEntry.accountLabel = label;
+        const poolIndex = this.connections.findIndex((e) => e.ws === ws) + 1;
+        log.info(`🍬 已绑定账号标识 [${label}] 号位 ${poolIndex}`);
+        this.broadcastSlotAssigned();
+        return;
+      }
 
       if (!request_id) {
         log.warn('收到无效消息: 缺少 request_id');
